@@ -1,2 +1,1 @@
-www.qq.com
-www.baidu.com
+# 本地域名列表，每行一个域名

@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Windows 网站访问控制程序
+macOS 网站访问控制程序
 通过修改 hosts 文件屏蔽指定域名
+支持 M1 ARM 和 Intel Mac
 """
 
 import os
@@ -12,41 +13,32 @@ import time
 import threading
 import requests
 from pathlib import Path
-import pystray
-from PIL import Image, ImageDraw
+
+# 尝试导入 pystray（系统托盘功能，可选）
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    Pystray_AVAILABLE = True
+except ImportError:
+    Pystray_AVAILABLE = False
+    print("警告: pystray 未安装，系统托盘功能将不可用")
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-
-# Windows 相关导入（仅在 Windows 上可用）
-if sys.platform == 'win32':
-    try:
-        import win32con
-        import win32gui
-        import win32process
-        import win32api
-        import win32reg
-    except ImportError:
-        print("警告: 无法导入 win32 模块，某些功能可能无法使用")
-        win32con = None
-        win32gui = None
-        win32process = None
-        win32api = None
-        win32reg = None
-else:
-    win32con = None
-    win32gui = None
-    win32process = None
-    win32api = None
-    win32reg = None
+import subprocess
+import plistlib
 
 # 配置常量
 API_URL = "https://app.walkingcode.com/API/kill-domains.php"
 DOMAINS_FILE = "domains.txt"
-HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+HOSTS_PATH = "/etc/hosts"
 LOCALHOST_IP = "127.0.0.1"
-CHECK_INTERVAL = 60 # 检查间隔（秒）
+CHECK_INTERVAL = 60  # 检查间隔（秒）
 MARKER_START = "# === Kill Domains Start ==="
 MARKER_END = "# === Kill Domains End ==="
+LAUNCH_AGENT_NAME = "com.domainkiller.plist"
+LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
+LAUNCH_AGENT_PATH = LAUNCH_AGENT_DIR / LAUNCH_AGENT_NAME
 
 
 class DomainKiller:
@@ -59,14 +51,15 @@ class DomainKiller:
         self.window = None
         self.window_thread = None
         self.password = None  # 保存从 API 获取的密码
-        # 获取当前exe路径（用于开机启动）
+        
+        # 获取当前可执行文件路径（用于开机启动）
         if getattr(sys, 'frozen', False):
-            # 如果是打包后的exe
+            # 如果是打包后的 app
             self.exe_path = sys.executable
         else:
             # 如果是开发环境
             self.exe_path = os.path.abspath(__file__)
-        
+    
     def fetch_domains_from_api(self):
         """从 API 获取域名列表和密码
         返回: 成功返回 (domains, password) 元组，失败返回 None
@@ -118,31 +111,106 @@ class DomainKiller:
             print(f"读取 domains.txt 失败: {e}")
         return domains
     
-    def read_hosts_file(self):
-        """读取 hosts 文件内容"""
+    def get_sudo_password(self):
+        """使用 osascript 获取 sudo 密码（非阻塞方式）"""
         try:
-            # Windows hosts 文件通常使用系统默认编码
-            # 先尝试 UTF-8，失败则使用系统默认编码
+            # 使用 osascript 显示对话框，但不在主线程阻塞
+            script = '''
+            tell application "System Events"
+                activate
+                try
+                    set theAnswer to display dialog "需要管理员权限来修改 hosts 文件" & return & return & "请输入您的管理员密码:" default answer "" buttons {"取消", "确定"} default button "确定" with hidden answer with icon caution
+                    return text returned of theAnswer
+                on error
+                    return ""
+                end try
+            end tell
+            '''
+            # 使用 Popen 而不是 run，避免阻塞
+            process = subprocess.Popen(
+                ['osascript', '-e', script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            # 等待最多 60 秒
+            try:
+                stdout, stderr = process.communicate(timeout=60)
+                if process.returncode == 0 and stdout.strip():
+                    return stdout.strip()
+                return None
+            except subprocess.TimeoutExpired:
+                process.kill()
+                print("密码输入超时")
+                return None
+        except Exception as e:
+            print(f"获取密码失败: {e}")
+            return None
+    
+    def read_hosts_file(self):
+        """读取 hosts 文件内容（需要 sudo 权限）"""
+        try:
+            # 先尝试直接读取（如果已经有权限）
             try:
                 with open(HOSTS_PATH, 'r', encoding='utf-8') as f:
                     return f.read()
-            except UnicodeDecodeError:
-                with open(HOSTS_PATH, 'r', encoding='gbk') as f:
-                    return f.read()
+            except PermissionError:
+                pass
+            
+            # 需要 sudo，使用密码（在后台线程中获取，避免阻塞）
+            # 注意：这里简化处理，如果无法读取，返回空字符串
+            # 实际使用时，应该在需要时才提示密码
+            print("提示: 需要管理员权限读取 hosts 文件")
+            print("请在需要时手动输入密码")
+            
+            # 暂时返回空，避免阻塞启动
+            return ""
         except Exception as e:
             print(f"读取 hosts 文件失败: {e}")
             return ""
     
     def write_hosts_file(self, content):
-        """写入 hosts 文件"""
+        """写入 hosts 文件（需要 sudo 权限）"""
         try:
-            # Windows hosts 文件通常使用系统默认编码
-            # 使用 UTF-8 编码写入（Windows 10+ 支持）
-            with open(HOSTS_PATH, 'w', encoding='utf-8', newline='\n') as f:
-                f.write(content)
-            return True
-        except PermissionError:
-            error_msg = "权限不足！请以管理员身份运行此程序。"
+            # 先尝试直接写入（如果已经有权限）
+            try:
+                with open(HOSTS_PATH, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(content)
+                return True
+            except PermissionError:
+                pass
+            
+            # 需要 sudo，使用密码
+            password = self.get_sudo_password()
+            if not password:
+                error_msg = "用户取消了密码输入"
+                print(error_msg)
+                if self.window:
+                    self.show_error_in_window(error_msg)
+                return False
+            
+            # 使用 sudo -S tee 写入 hosts 文件
+            process = subprocess.Popen(
+                ['sudo', '-S', 'tee', HOSTS_PATH],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            # 先发送密码，然后发送内容
+            input_data = password + '\n' + content
+            stdout, stderr = process.communicate(input=input_data, timeout=10)
+            
+            if process.returncode == 0:
+                return True
+            else:
+                error_msg = f"写入 hosts 文件失败: {stderr}"
+                print(error_msg)
+                if self.window:
+                    self.show_error_in_window(error_msg)
+                return False
+        except subprocess.TimeoutExpired:
+            error_msg = "写入 hosts 文件超时"
             print(error_msg)
             if self.window:
                 self.show_error_in_window(error_msg)
@@ -213,9 +281,8 @@ class DomainKiller:
         except Exception as e:
             error_msg = f"屏蔽域名失败: {e}"
             print(error_msg)
-            # 如果是权限错误，显示更明确的提示
-            if "Permission" in str(e) or "拒绝访问" in str(e) or "denied" in str(e).lower():
-                error_msg += "\n\n请确保以管理员身份运行此程序！"
+            if "Permission" in str(e) or "denied" in str(e).lower():
+                error_msg += "\n\n请确保有 sudo 权限！"
             if self.window:
                 self.show_error_in_window(error_msg)
             return False
@@ -232,41 +299,34 @@ class DomainKiller:
     
     def startup_block(self):
         """启动时立即从本地文件读取并屏蔽（不等待 API）"""
-        # 从本地文件读取域名
-        self.current_domains = self.read_domains_file()
-        
-        if self.current_domains:
-            # 有域名需要屏蔽
-            success = self.block_domains(self.current_domains)
-            if success:
-                msg = f"启动时已屏蔽 {len(self.current_domains)} 个域名（来自本地文件）"
-                print(msg)
-                if self.window:
-                    self.update_status_in_window(msg)
-                    self.update_window_domains()
-            else:
-                msg = "启动时屏蔽域名失败，请检查是否以管理员身份运行"
-                print(msg)
-                if self.window:
-                    self.update_status_in_window(msg, error=True)
-        else:
-            # 本地文件为空，检查 hosts 文件中是否已有屏蔽规则
-            hosts_content = self.read_hosts_file()
-            if MARKER_START in hosts_content:
-                # hosts 文件中已有屏蔽规则，保持现状
-                # 从 hosts 文件中提取当前屏蔽的域名
-                self.current_domains = self.extract_domains_from_hosts(hosts_content)
-                if self.current_domains:
-                    msg = f"检测到已有 {len(self.current_domains)} 个域名被屏蔽"
+        try:
+            # 从本地文件读取域名
+            self.current_domains = self.read_domains_file()
+            
+            if self.current_domains:
+                # 有域名需要屏蔽
+                success = self.block_domains(self.current_domains)
+                if success:
+                    msg = f"启动时已屏蔽 {len(self.current_domains)} 个域名（来自本地文件）"
                     print(msg)
                     if self.window:
                         self.update_status_in_window(msg)
                         self.update_window_domains()
+                else:
+                    msg = "启动时屏蔽域名失败，将在首次同步时重试"
+                    print(msg)
+                    if self.window:
+                        self.update_status_in_window(msg)
             else:
-                msg = "启动时：本地文件为空，未发现屏蔽规则"
+                # 本地文件为空，显示状态
+                msg = "启动时：本地文件为空，等待同步"
                 print(msg)
                 if self.window:
                     self.update_status_in_window(msg)
+        except Exception as e:
+            print(f"启动时处理失败: {e}")
+            if self.window:
+                self.update_status_in_window(f"启动错误: {e}", error=True)
     
     def extract_domains_from_hosts(self, hosts_content):
         """从 hosts 文件内容中提取被屏蔽的域名"""
@@ -331,7 +391,7 @@ class DomainKiller:
                     self.update_status_in_window(msg)
                     self.update_window_domains()
             else:
-                msg = "同步后屏蔽域名失败，请检查是否以管理员身份运行"
+                msg = "同步后屏蔽域名失败，请检查是否有 sudo 权限"
                 print(msg)
                 if self.window:
                     self.update_status_in_window(msg, error=True)
@@ -345,7 +405,7 @@ class DomainKiller:
                     self.update_status_in_window(msg)
                     self.update_window_domains()
             else:
-                msg = "清除屏蔽规则失败，请检查是否以管理员身份运行"
+                msg = "清除屏蔽规则失败，请检查是否有 sudo 权限"
                 print(msg)
                 if self.window:
                     self.update_status_in_window(msg, error=True)
@@ -366,21 +426,29 @@ class DomainKiller:
     
     def create_tray_icon(self):
         """创建系统托盘图标"""
-        # 创建简单的图标
-        image = Image.new('RGB', (64, 64), color='red')
-        draw = ImageDraw.Draw(image)
-        draw.ellipse([16, 16, 48, 48], fill='white', outline='black', width=2)
+        if not Pystray_AVAILABLE:
+            print("系统托盘功能不可用（pystray 未安装）")
+            return None
         
-        menu = pystray.Menu(
-            pystray.MenuItem("显示窗口", self.on_show_window),
-            pystray.MenuItem("立即同步", self.on_sync),
-            pystray.MenuItem("恢复访问", self.on_restore),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出", self.on_quit)
-        )
-        
-        icon = pystray.Icon("DomainKiller", image, "网站访问控制", menu)
-        return icon
+        try:
+            # 创建简单的图标
+            image = Image.new('RGB', (64, 64), color='red')
+            draw = ImageDraw.Draw(image)
+            draw.ellipse([16, 16, 48, 48], fill='white', outline='black', width=2)
+            
+            menu = pystray.Menu(
+                pystray.MenuItem("显示窗口", self.on_show_window),
+                pystray.MenuItem("立即同步", self.on_sync),
+                pystray.MenuItem("恢复访问", self.on_restore),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", self.on_quit)
+            )
+            
+            icon = pystray.Icon("DomainKiller", image, "网站访问控制", menu)
+            return icon
+        except Exception as e:
+            print(f"创建系统托盘图标失败: {e}")
+            return None
     
     def on_show_window(self, icon, item):
         """显示窗口菜单项"""
@@ -436,7 +504,7 @@ class DomainKiller:
                     # 清空密码输入框
                     self.password_entry.delete(0, tk.END)
                 else:
-                    msg = "恢复访问失败，请检查是否以管理员身份运行"
+                    msg = "恢复访问失败，请检查是否有 sudo 权限"
                     if self.window:
                         self.update_status_in_window(msg, error=True)
             else:
@@ -597,32 +665,27 @@ class DomainKiller:
         if self.icon:
             self.icon.stop()
     
-    def hide_window(self):
-        """隐藏控制台窗口（仅在 Windows 上）"""
-        try:
-            if sys.platform == 'win32' and win32gui:
-                # 获取当前进程的窗口句柄
-                hwnd = win32gui.GetForegroundWindow()
-                if hwnd:
-                    # 隐藏窗口
-                    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-        except Exception as e:
-            print(f"隐藏窗口失败: {e}")
-    
     def create_window(self):
-        """创建显示窗口"""
-        def run_window():
+        """创建显示窗口（必须在主线程调用）"""
+        try:
+            if self.window is not None:
+                try:
+                    if self.window.winfo_exists():
+                        return
+                except:
+                    # 窗口已销毁，重新创建
+                    self.window = None
+            
+            # 直接在主线程创建窗口
             self.window = tk.Tk()
+        except Exception as e:
+            print(f"创建窗口失败: {e}")
+            return
+        
+        try:
             self.window.title("网站访问控制 - 屏蔽域名列表")
             self.window.geometry("600x500")
             self.window.resizable(True, True)
-            
-            # 设置窗口图标（如果有）
-            try:
-                if sys.platform == 'win32':
-                    self.window.iconbitmap(default='')
-            except:
-                pass
             
             # 状态栏
             status_frame = ttk.Frame(self.window, padding="10")
@@ -653,8 +716,6 @@ class DomainKiller:
                 text="立即同步",
                 command=lambda: threading.Thread(target=self.sync_and_block, daemon=True).start()
             ).pack(side=tk.LEFT, padx=5)
-            
-            # 恢复访问按钮已移到密码输入区域，这里移除
             
             ttk.Button(
                 button_frame,
@@ -749,20 +810,31 @@ class DomainKiller:
             
             # 窗口关闭事件
             def on_closing():
-                self.window.withdraw()  # 隐藏窗口而不是关闭
+                try:
+                    self.window.withdraw()  # 隐藏窗口而不是关闭
+                except:
+                    pass
             
-            self.window.protocol("WM_DELETE_WINDOW", on_closing)
+            try:
+                self.window.protocol("WM_DELETE_WINDOW", on_closing)
+            except:
+                pass
             
             # 初始化显示
-            self.update_window_domains()
+            try:
+                self.update_window_domains()
+            except Exception as e:
+                print(f"初始化窗口显示失败: {e}")
             
-            # 运行窗口
-            self.window.mainloop()
-        
-        # 在新线程中运行窗口
-        if self.window_thread is None or not self.window_thread.is_alive():
-            self.window_thread = threading.Thread(target=run_window, daemon=True)
-            self.window_thread.start()
+            # 确保窗口创建完成
+            try:
+                self.window.update_idletasks()
+            except:
+                pass
+        except Exception as e:
+            print(f"创建窗口组件失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def update_window_domains(self):
         """更新窗口中的域名列表"""
@@ -817,37 +889,14 @@ class DomainKiller:
     
     def is_startup_enabled(self):
         """检查是否已设置开机启动"""
-        if sys.platform != 'win32' or not win32reg:
-            return False
-        
         try:
-            # 打开注册表项
-            key = win32reg.OpenKey(
-                win32reg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0,
-                win32reg.KEY_READ
-            )
-            
-            try:
-                # 尝试读取值
-                value, _ = win32reg.QueryValueEx(key, "DomainKiller")
-                win32reg.CloseKey(key)
-                return value == self.exe_path
-            except FileNotFoundError:
-                win32reg.CloseKey(key)
-                return False
+            return LAUNCH_AGENT_PATH.exists()
         except Exception as e:
             print(f"检查开机启动失败: {e}")
             return False
     
     def toggle_startup(self):
         """切换开机启动状态"""
-        if sys.platform != 'win32' or not win32reg:
-            import tkinter.messagebox as messagebox
-            messagebox.showwarning("警告", "开机启动功能仅在 Windows 系统上可用")
-            return
-        
         try:
             if self.startup_var.get():
                 # 启用开机启动
@@ -862,30 +911,53 @@ class DomainKiller:
             self.startup_var.set(not self.startup_var.get())
     
     def enable_startup(self):
-        """启用开机启动"""
-        if sys.platform != 'win32' or not win32reg:
-            return False
-        
+        """启用开机启动（使用 LaunchAgent）"""
         try:
-            # 打开注册表项（可写）
-            key = win32reg.OpenKey(
-                win32reg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0,
-                win32reg.KEY_WRITE
+            # 确保 LaunchAgents 目录存在
+            LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # 获取可执行文件路径
+            if getattr(sys, 'frozen', False):
+                # 如果是打包后的可执行文件
+                app_path = sys.executable
+                # 如果是 app bundle，需要找到实际的可执行文件
+                if app_path.endswith('.app'):
+                    # 查找 app bundle 内的可执行文件
+                    app_name = os.path.basename(app_path).replace('.app', '')
+                    executable_path = os.path.join(app_path, 'Contents', 'MacOS', app_name)
+                    if os.path.exists(executable_path):
+                        app_path = executable_path
+                program_args = [app_path]
+            else:
+                # 如果是开发环境，使用 Python 解释器运行脚本
+                python_path = sys.executable
+                script_path = os.path.abspath(__file__)
+                program_args = [python_path, script_path]
+            
+            # 创建 plist 文件
+            plist_data = {
+                'Label': 'com.domainkiller',
+                'ProgramArguments': program_args,
+                'RunAtLoad': True,
+                'KeepAlive': False,
+            }
+            
+            # 写入 plist 文件
+            with open(LAUNCH_AGENT_PATH, 'wb') as f:
+                plistlib.dump(plist_data, f)
+            
+            # 加载 LaunchAgent（使用 launchctl load -w 确保立即生效）
+            result = subprocess.run(
+                ['launchctl', 'load', '-w', str(LAUNCH_AGENT_PATH)],
+                capture_output=True,
+                text=True,
+                check=False
             )
             
-            # 设置注册表值
-            win32reg.SetValueEx(
-                key,
-                "DomainKiller",
-                0,
-                win32reg.REG_SZ,
-                self.exe_path
-            )
+            if result.returncode != 0:
+                print(f"加载 LaunchAgent 警告: {result.stderr}")
             
-            win32reg.CloseKey(key)
-            print(f"已启用开机启动: {self.exe_path}")
+            print(f"已启用开机启动: {LAUNCH_AGENT_PATH}")
             return True
         except Exception as e:
             print(f"启用开机启动失败: {e}")
@@ -893,26 +965,21 @@ class DomainKiller:
     
     def disable_startup(self):
         """禁用开机启动"""
-        if sys.platform != 'win32' or not win32reg:
-            return False
-        
         try:
-            # 打开注册表项（可写）
-            key = win32reg.OpenKey(
-                win32reg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0,
-                win32reg.KEY_WRITE
-            )
+            if LAUNCH_AGENT_PATH.exists():
+                # 卸载 LaunchAgent（使用 launchctl unload -w）
+                result = subprocess.run(
+                    ['launchctl', 'unload', '-w', str(LAUNCH_AGENT_PATH)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                # 删除 plist 文件
+                try:
+                    LAUNCH_AGENT_PATH.unlink()
+                except Exception as e:
+                    print(f"删除 plist 文件失败: {e}")
             
-            # 删除注册表值
-            try:
-                win32reg.DeleteValue(key, "DomainKiller")
-            except FileNotFoundError:
-                # 值不存在，忽略
-                pass
-            
-            win32reg.CloseKey(key)
             print("已禁用开机启动")
             return True
         except Exception as e:
@@ -921,48 +988,110 @@ class DomainKiller:
     
     def run(self):
         """运行主程序"""
-        # 隐藏控制台窗口
-        self.hide_window()
-        
-        # 创建并显示窗口
-        self.create_window()
-        
-        # 启动时立即从本地文件读取并屏蔽（不等待 API）
-        self.startup_block()
-        
-        # 首次同步（在后台尝试从 API 获取最新域名）
-        threading.Thread(target=self.sync_and_block, daemon=True).start()
-        
-        # 启动定时检查线程
-        self.running = True
-        check_thread = threading.Thread(target=self.check_and_update, daemon=True)
-        check_thread.start()
-        
-        # 创建并运行系统托盘图标
-        self.icon = self.create_tray_icon()
-        self.icon.run()
+        try:
+            # 创建并显示窗口（必须在主线程）
+            self.create_window()
+            
+            if not self.window:
+                print("错误: 无法创建窗口")
+                return
+            
+            # 启动定时检查线程
+            self.running = True
+            
+            # 启动时立即从本地文件读取并屏蔽（在后台线程，避免阻塞）
+            def startup_in_background():
+                try:
+                    time.sleep(0.5)  # 等待窗口完全显示
+                    self.startup_block()
+                except Exception as e:
+                    print(f"启动时处理失败: {e}")
+                    if self.window:
+                        try:
+                            self.update_status_in_window(f"启动错误: {e}", error=True)
+                        except:
+                            pass
+            
+            threading.Thread(target=startup_in_background, daemon=True).start()
+            
+            # 首次同步（在后台尝试从 API 获取最新域名）
+            def sync_in_background():
+                try:
+                    self.sync_and_block()
+                except Exception as e:
+                    print(f"同步失败: {e}")
+            
+            threading.Thread(target=sync_in_background, daemon=True).start()
+            
+            # 启动定时检查线程
+            def check_in_background():
+                try:
+                    self.check_and_update()
+                except Exception as e:
+                    print(f"定时检查失败: {e}")
+            
+            check_thread = threading.Thread(target=check_in_background, daemon=True)
+            check_thread.start()
+            
+            # 创建并运行系统托盘图标（如果可用）
+            try:
+                self.icon = self.create_tray_icon()
+                if self.icon:
+                    # 在后台线程运行系统托盘
+                    def run_icon():
+                        try:
+                            self.icon.run()
+                        except Exception as e:
+                            print(f"系统托盘运行失败: {e}")
+                    icon_thread = threading.Thread(target=run_icon, daemon=True)
+                    icon_thread.start()
+            except Exception as e:
+                print(f"创建系统托盘失败: {e}")
+            
+            # 运行窗口主循环（必须在主线程）
+            if self.window:
+                self.window.mainloop()
+        except Exception as e:
+            import traceback
+            print(f"运行程序时发生错误: {e}")
+            print(traceback.format_exc())
+            raise
 
 
 def main():
     """主函数"""
-    # 检查是否在 Windows 系统
-    if sys.platform != 'win32':
-        print("此程序仅支持 Windows 系统")
-        return
-    
-    # 检查管理员权限（修改 hosts 文件需要）
     try:
-        # 尝试写入 hosts 文件来检查权限
-        test_path = HOSTS_PATH
-        if not os.access(test_path, os.W_OK):
-            print("警告: 可能需要管理员权限来修改 hosts 文件")
-            print("请以管理员身份运行此程序")
+        # 检查是否在 macOS 系统
+        if sys.platform != 'darwin':
+            print("此程序仅支持 macOS 系统")
+            return
+        
+        # 检查 sudo 权限提示
+        print("提示: 修改 hosts 文件需要 sudo 权限，程序运行时会提示输入密码")
+        
+        # 运行程序
+        killer = DomainKiller()
+        killer.run()
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+        sys.exit(0)
     except Exception as e:
-        print(f"权限检查失败: {e}")
-    
-    # 运行程序
-    killer = DomainKiller()
-    killer.run()
+        # 捕获所有异常，显示错误信息
+        import traceback
+        error_msg = f"程序发生错误: {e}\n\n详细错误信息:\n{traceback.format_exc()}"
+        print(error_msg)
+        
+        # 尝试显示错误对话框
+        try:
+            import tkinter.messagebox as messagebox
+            root = tk.Tk()
+            root.withdraw()  # 隐藏主窗口
+            messagebox.showerror("程序错误", f"程序发生错误:\n{e}\n\n请查看控制台获取详细信息")
+            root.destroy()
+        except:
+            pass
+        
+        sys.exit(1)
 
 
 if __name__ == "__main__":

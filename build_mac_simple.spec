@@ -1,24 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller 配置文件
-使用方法: pyinstaller build.spec
+PyInstaller 配置文件 - macOS 简化版
+使用简化稳定版本
 """
 
 block_cipher = None
 
 a = Analysis(
-    ['kill_domains.py'],
+    ['kill_domains_mac_simple.py'],
     pathex=[],
     binaries=[],
-    datas=[('domains.txt', '.')],  # 包含 domains.txt 文件
+    datas=[
+        ('domains.txt', '.'),  # 将 domains.txt 打包到应用目录
+    ],
     hiddenimports=[
-        'pystray',
-        'PIL',
-        'win32gui',
-        'win32con',
-        'win32process',
-        'win32api',
-        'win32reg',
+        'tkinter',
     ],
     hookspath=[],
     hooksconfig={},
@@ -43,15 +39,30 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # 隐藏控制台窗口
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # 可以指定图标文件路径，如: icon='icon.ico'
+    icon=None,
+)
+
+app = BUNDLE(
+    exe,
+    name='DomainKiller.app',
+    icon=None,
+    bundle_identifier='com.domainkiller.app',
+    info_plist={
+        'NSPrincipalClass': 'NSApplication',
+        'NSHighResolutionCapable': 'True',
+        'CFBundleName': 'DomainKiller',
+        'CFBundleDisplayName': '网站访问控制',
+        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.0.0',
+    },
 )
 

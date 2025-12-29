@@ -1,0 +1,29 @@
+========================================
+macOS 编译说明
+========================================
+
+由于环境限制，请手动运行以下命令来编译：
+
+方法一：使用一键编译脚本（推荐）
+----------------------------------------
+./编译_MAC_一键.sh
+
+方法二：手动编译
+----------------------------------------
+# 1. 安装依赖
+pip3 install -r requirements.txt pyinstaller
+
+# 2. 编译
+./build_mac.sh
+
+# 或者编译通用二进制（支持 M1 和 Intel）
+./build_mac_universal.sh
+
+编译完成后，app 位于：
+  dist/DomainKiller.app
+
+使用方法：
+  双击运行: open dist/DomainKiller.app
+  或命令行: ./dist/DomainKiller.app/Contents/MacOS/DomainKiller
+
+========================================
