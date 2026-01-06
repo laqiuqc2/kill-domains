@@ -16,6 +16,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import subprocess
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 # 配置常量
 API_URL = "https://app.walkingcode.com/API/kill-domains.php"
@@ -26,6 +29,244 @@ CHECK_INTERVAL = 60
 MARKER_START = "# === Kill Domains Start ==="
 MARKER_END = "# === Kill Domains End ==="
 PFCTL_RULES_FILE = "/tmp/domainkiller_pfctl_rules.conf"
+PROXY_PORT = 8888  # 本地代理服务器端口
+
+
+class BlockingProxyHandler(BaseHTTPRequestHandler):
+    """HTTP 代理服务器处理器 - 拦截被屏蔽的域名"""
+    
+    blocked_domains = set()  # 被屏蔽的域名集合
+    
+    def do_GET(self):
+        """处理 GET 请求"""
+        self.handle_request()
+    
+    def do_POST(self):
+        """处理 POST 请求"""
+        self.handle_request()
+    
+    def do_CONNECT(self):
+        """处理 HTTPS CONNECT 请求"""
+        self.handle_https_request()
+    
+    def handle_request(self):
+        """处理 HTTP 请求"""
+        try:
+            # 解析请求 URL
+            url = self.path
+            if url.startswith('http://'):
+                parsed = urlparse(url)
+            else:
+                parsed = urlparse('http://' + url)
+            
+            host = parsed.netloc or parsed.path.split('/')[0]
+            if ':' in host:
+                host = host.split(':')[0]
+            
+            # 检查域名是否被屏蔽
+            if self.is_blocked(host):
+                self.send_blocked_response()
+                return
+            
+            # 转发请求到目标服务器
+            self.forward_request()
+        except Exception as e:
+            print(f"代理处理请求错误: {e}")
+            self.send_error(500, str(e))
+    
+    def handle_https_request(self):
+        """处理 HTTPS CONNECT 请求"""
+        try:
+            # CONNECT 请求格式: CONNECT host:port HTTP/1.1
+            host_port = self.path.split(' ')[0] if ' ' in self.path else self.path
+            host = host_port.split(':')[0]
+            
+            # 检查域名是否被屏蔽
+            if self.is_blocked(host):
+                self.send_blocked_response()
+                return
+            
+            # 转发 CONNECT 请求
+            self.forward_https_request(host_port)
+        except Exception as e:
+            print(f"代理处理 HTTPS 请求错误: {e}")
+            self.send_error(500, str(e))
+    
+    def is_blocked(self, host):
+        """检查域名是否被屏蔽"""
+        if not host:
+            return False
+        
+        # 检查完整域名
+        if host in self.blocked_domains:
+            return True
+        
+        # 检查域名变体（如 www.domain.com 和 domain.com）
+        parts = host.split('.')
+        if len(parts) >= 2:
+            # 检查去掉 www 后的域名
+            if parts[0] == 'www' and len(parts) > 2:
+                base_domain = '.'.join(parts[1:])
+                if base_domain in self.blocked_domains:
+                    return True
+            # 检查添加 www 后的域名
+            www_domain = 'www.' + host
+            if www_domain in self.blocked_domains:
+                return True
+        
+        return False
+    
+    def send_blocked_response(self):
+        """发送屏蔽响应"""
+        self.send_response(403)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        blocked_html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>网站已被屏蔽</title>
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                h1 { color: #d32f2f; }
+            </style>
+        </head>
+        <body>
+            <h1>🚫 网站已被屏蔽</h1>
+            <p>该网站已被管理员屏蔽，无法访问。</p>
+        </body>
+        </html>
+        """
+        self.wfile.write(blocked_html.encode('utf-8'))
+    
+    def forward_request(self):
+        """转发 HTTP 请求到目标服务器"""
+        try:
+            # 解析目标 URL
+            url = self.path
+            if not url.startswith('http://'):
+                url = 'http://' + url
+            
+            parsed = urlparse(url)
+            host = parsed.netloc or parsed.path.split('/')[0]
+            port = 80
+            if ':' in host:
+                host, port_str = host.split(':')
+                port = int(port_str)
+            
+            # 连接到目标服务器
+            try:
+                target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                target_socket.settimeout(10)
+                target_socket.connect((host, port))
+                
+                # 构建请求
+                request_line = f"{self.command} {parsed.path or '/'} HTTP/1.1\r\n"
+                headers = f"Host: {host}\r\n"
+                headers += "Connection: close\r\n"
+                
+                # 转发原始请求头（除了 Host）
+                for header, value in self.headers.items():
+                    if header.lower() != 'host' and header.lower() != 'connection':
+                        headers += f"{header}: {value}\r\n"
+                
+                request = request_line + headers + "\r\n"
+                
+                # 发送请求
+                target_socket.sendall(request.encode())
+                
+                # 接收响应并转发
+                response_data = b''
+                while True:
+                    chunk = target_socket.recv(4096)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                
+                target_socket.close()
+                
+                # 发送响应给客户端
+                self.wfile.write(response_data)
+            except Exception as e:
+                print(f"转发请求失败: {e}")
+                self.send_error(502, f"Proxy error: {str(e)}")
+        except Exception as e:
+            print(f"转发请求异常: {e}")
+            self.send_error(502, f"Proxy error: {str(e)}")
+    
+    def forward_https_request(self, host_port):
+        """转发 HTTPS CONNECT 请求"""
+        try:
+            # 解析目标地址
+            if ':' in host_port:
+                host, port_str = host_port.split(':')
+                port = int(port_str)
+            else:
+                host = host_port
+                port = 443
+            
+            # 连接到目标服务器
+            try:
+                target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                target_socket.settimeout(10)
+                target_socket.connect((host, port))
+                
+                # 发送 200 Connection Established 响应
+                self.send_response(200, 'Connection Established')
+                self.end_headers()
+                
+                # 建立双向隧道（使用线程）
+                import threading
+                client_socket = self.connection
+                tunnel_active = threading.Event()
+                tunnel_active.set()
+                
+                def forward_to_target():
+                    try:
+                        while tunnel_active.is_set():
+                            data = client_socket.recv(4096)
+                            if not data:
+                                break
+                            target_socket.sendall(data)
+                    except:
+                        pass
+                    finally:
+                        tunnel_active.clear()
+                
+                def forward_to_client():
+                    try:
+                        while tunnel_active.is_set():
+                            data = target_socket.recv(4096)
+                            if not data:
+                                break
+                            client_socket.sendall(data)
+                    except:
+                        pass
+                    finally:
+                        tunnel_active.clear()
+                
+                # 启动转发线程
+                t1 = threading.Thread(target=forward_to_target, daemon=True)
+                t2 = threading.Thread(target=forward_to_client, daemon=True)
+                t1.start()
+                t2.start()
+                
+                # 等待线程结束
+                t1.join(timeout=300)  # 5分钟超时
+                t2.join(timeout=300)
+                tunnel_active.clear()
+                target_socket.close()
+            except Exception as e:
+                print(f"转发 HTTPS 请求失败: {e}")
+                self.send_error(502, f"HTTPS Proxy error: {str(e)}")
+        except Exception as e:
+            print(f"转发 HTTPS 请求异常: {e}")
+            self.send_error(502, f"HTTPS Proxy error: {str(e)}")
+    
+    def log_message(self, format, *args):
+        """禁用默认日志输出"""
+        pass
 
 
 class DomainKiller:
@@ -85,6 +326,9 @@ class DomainKiller:
         self.sudo_password = None  # 缓存 sudo 密码（仅在内存中）
         self.use_pfctl = True  # 使用 pfctl 实现实时拦截
         self.api_domains = set()  # API 同步的域名列表（当前正在屏蔽的）
+        self.proxy_server = None  # 代理服务器实例
+        self.proxy_thread = None  # 代理服务器线程
+        self.use_proxy = True  # 使用代理服务器拦截（对 Safari 更有效）
         
     def fetch_domains_from_api(self):
         """从 API 获取域名列表和密码"""
@@ -430,6 +674,10 @@ class DomainKiller:
             
             if load_process.returncode == 0:
                 print(f"✅ pfctl 规则已应用，实时拦截 {len(all_ips)} 个IP地址")
+                
+                # 验证规则是否生效
+                self.verify_pfctl_rules()
+                
                 return True
             else:
                 print(f"⚠️ pfctl 规则应用失败: {stderr}")
@@ -437,6 +685,37 @@ class DomainKiller:
         except Exception as e:
             print(f"⚠️ 设置 pfctl 规则失败: {e}")
             # 即使失败，也不影响 hosts 文件屏蔽
+            return False
+    
+    def verify_pfctl_rules(self):
+        """验证 pfctl 规则是否生效"""
+        try:
+            if not self.sudo_password:
+                return False
+            
+            process = subprocess.Popen(
+                ['sudo', '-S', 'pfctl', '-s', 'rules'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate(input=self.sudo_password + '\n', timeout=5)
+            
+            if process.returncode == 0:
+                # 统计 block 规则数量
+                block_count = stdout.count('block out quick')
+                if block_count > 0:
+                    print(f"✅ pfctl 验证: 当前有 {block_count} 条拦截规则生效")
+                    return True
+                else:
+                    print("⚠️ pfctl 验证: 未找到拦截规则")
+                    return False
+            else:
+                print(f"⚠️ pfctl 验证失败: {stderr}")
+                return False
+        except Exception as e:
+            print(f"⚠️ pfctl 验证异常: {e}")
             return False
     
     def remove_pfctl_rules(self):
@@ -467,19 +746,297 @@ class DomainKiller:
         except:
             return False
     
-    def flush_dns_cache(self):
-        """刷新 DNS 缓存（macOS）- 强制刷新"""
+    def check_proxy_server_status(self):
+        """检查代理服务器是否正在运行"""
+        try:
+            # 检查代理服务器实例是否存在
+            if not self.proxy_server:
+                return False
+            
+            # 检查线程是否还在运行
+            if self.proxy_thread and not self.proxy_thread.is_alive():
+                return False
+            
+            # 尝试连接到代理服务器端口
+            try:
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_socket.settimeout(0.5)
+                result = test_socket.connect_ex(('127.0.0.1', PROXY_PORT))
+                test_socket.close()
+                return result == 0
+            except:
+                return False
+        except:
+            return False
+    
+    def update_proxy_status_in_window(self):
+        """更新窗口中的代理服务器状态"""
+        if not self.window:
+            return
+        
+        try:
+            is_running = self.check_proxy_server_status()
+            if is_running:
+                self.proxy_status_label.config(
+                    text=f"代理: ✅ 运行中 (端口 {PROXY_PORT})",
+                    foreground="green"
+                )
+            else:
+                self.proxy_status_label.config(
+                    text="代理: ❌ 未运行",
+                    foreground="red"
+                )
+        except Exception as e:
+            print(f"更新代理状态失败: {e}")
+    
+    def start_proxy_server(self, domains):
+        """启动本地 HTTP 代理服务器"""
+        if not self.use_proxy:
+            if self.window:
+                self.window.after(0, lambda: self.update_proxy_status_in_window())
+            return False
+        
+        try:
+            # 停止旧代理服务器（如果存在）
+            self.stop_proxy_server()
+            
+            # 更新被屏蔽的域名列表
+            BlockingProxyHandler.blocked_domains = set(domains)
+            # 添加域名变体
+            for domain in domains:
+                BlockingProxyHandler.blocked_domains.add(domain)
+                BlockingProxyHandler.blocked_domains.add('www.' + domain)
+                if domain.startswith('www.'):
+                    BlockingProxyHandler.blocked_domains.add(domain[4:])
+            
+            # 创建代理服务器
+            self.proxy_server = HTTPServer(('127.0.0.1', PROXY_PORT), BlockingProxyHandler)
+            
+            # 在后台线程中运行代理服务器
+            def run_proxy():
+                try:
+                    print(f"✅ 代理服务器已启动在端口 {PROXY_PORT}")
+                    if self.window:
+                        self.window.after(0, lambda: self.update_proxy_status_in_window())
+                    self.proxy_server.serve_forever()
+                except Exception as e:
+                    print(f"代理服务器错误: {e}")
+                    if self.window:
+                        self.window.after(0, lambda: self.update_proxy_status_in_window())
+            
+            self.proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+            self.proxy_thread.start()
+            
+            # 等待服务器启动
+            time.sleep(0.5)
+            
+            # 更新状态显示
+            if self.window:
+                self.window.after(0, lambda: self.update_proxy_status_in_window())
+            
+            # 设置系统代理
+            result = self.setup_system_proxy()
+            
+            # 再次更新状态（确保显示最新状态）
+            if self.window:
+                self.window.after(100, lambda: self.update_proxy_status_in_window())
+            
+            return result
+        except Exception as e:
+            print(f"启动代理服务器失败: {e}")
+            import traceback
+            traceback.print_exc()
+            if self.window:
+                self.window.after(0, lambda: self.update_proxy_status_in_window())
+            return False
+    
+    def stop_proxy_server(self):
+        """停止代理服务器"""
+        try:
+            if self.proxy_server:
+                self.proxy_server.shutdown()
+                self.proxy_server = None
+            # 清除系统代理设置
+            self.clear_system_proxy()
+            # 更新状态显示
+            if self.window:
+                self.window.after(0, lambda: self.update_proxy_status_in_window())
+        except:
+            pass
+    
+    def setup_system_proxy(self):
+        """设置系统代理（需要管理员权限）"""
+        try:
+            if not self.sudo_password:
+                password = self.get_sudo_password("需要管理员权限设置系统代理", use_cache=True)
+                if not password:
+                    return False
+            
+            # 获取当前网络服务名称
+            try:
+                process = subprocess.Popen(
+                    ['networksetup', '-listallnetworkservices'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate(timeout=5)
+                
+                if process.returncode == 0:
+                    # 查找第一个活动网络服务（通常是 Wi-Fi 或 Ethernet）
+                    lines = stdout.strip().split('\n')[1:]  # 跳过第一行标题
+                    active_service = None
+                    for line in lines:
+                        service = line.strip()
+                        if service and not service.startswith('*'):
+                            active_service = service
+                            break
+                    
+                    if active_service:
+                        # 设置 HTTP 代理
+                        http_proxy_cmd = [
+                            'sudo', '-S', 'networksetup', '-setwebproxy',
+                            active_service, '127.0.0.1', str(PROXY_PORT)
+                        ]
+                        process = subprocess.Popen(
+                            http_proxy_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        process.communicate(input=self.sudo_password + '\n', timeout=5)
+                        
+                        # 设置 HTTPS 代理
+                        https_proxy_cmd = [
+                            'sudo', '-S', 'networksetup', '-setsecurewebproxy',
+                            active_service, '127.0.0.1', str(PROXY_PORT)
+                        ]
+                        process = subprocess.Popen(
+                            https_proxy_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        process.communicate(input=self.sudo_password + '\n', timeout=5)
+                        
+                        # 启用代理
+                        enable_cmd = [
+                            'sudo', '-S', 'networksetup', '-setwebproxystate',
+                            active_service, 'on'
+                        ]
+                        process = subprocess.Popen(
+                            enable_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        process.communicate(input=self.sudo_password + '\n', timeout=5)
+                        
+                        enable_https_cmd = [
+                            'sudo', '-S', 'networksetup', '-setsecurewebproxystate',
+                            active_service, 'on'
+                        ]
+                        process = subprocess.Popen(
+                            enable_https_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        process.communicate(input=self.sudo_password + '\n', timeout=5)
+                        
+                        print(f"✅ 系统代理已设置: {active_service} -> 127.0.0.1:{PROXY_PORT}")
+                        return True
+            except Exception as e:
+                print(f"设置系统代理失败: {e}")
+                return False
+        except Exception as e:
+            print(f"设置系统代理异常: {e}")
+            return False
+    
+    def clear_system_proxy(self):
+        """清除系统代理设置"""
         try:
             if not self.sudo_password:
                 return
             
+            # 获取当前网络服务名称
+            try:
+                process = subprocess.Popen(
+                    ['networksetup', '-listallnetworkservices'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate(timeout=5)
+                
+                if process.returncode == 0:
+                    lines = stdout.strip().split('\n')[1:]
+                    for line in lines:
+                        service = line.strip()
+                        if service and not service.startswith('*'):
+                            # 禁用代理
+                            try:
+                                disable_cmd = [
+                                    'sudo', '-S', 'networksetup', '-setwebproxystate',
+                                    service, 'off'
+                                ]
+                                process = subprocess.Popen(
+                                    disable_cmd,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True
+                                )
+                                process.communicate(input=self.sudo_password + '\n', timeout=5)
+                                
+                                disable_https_cmd = [
+                                    'sudo', '-S', 'networksetup', '-setsecurewebproxystate',
+                                    service, 'off'
+                                ]
+                                process = subprocess.Popen(
+                                    disable_https_cmd,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True
+                                )
+                                process.communicate(input=self.sudo_password + '\n', timeout=5)
+                            except:
+                                pass
+            except:
+                pass
+        except:
+            pass
+    
+    def flush_dns_cache(self):
+        """刷新 DNS 缓存（macOS）- 强制刷新（增强版，支持 Safari）"""
+        try:
+            if not self.sudo_password:
+                return
+            
+            print("🔄 正在强制刷新 DNS 缓存（包括 Safari）...")
+            
             # macOS 不同版本使用不同的命令（按顺序执行，确保刷新）
+            # 增强版：添加更多刷新命令，确保 Safari 也能生效
             commands = [
+                # 1. 刷新系统 DNS 缓存
                 ['sudo', '-S', 'dscacheutil', '-flushcache'],
+                
+                # 2. 重启 mDNSResponder（macOS 的 DNS 服务）
                 ['sudo', '-S', 'killall', '-HUP', 'mDNSResponder'],
+                
+                # 3. 重启 mDNSResponderHelper
                 ['sudo', '-S', 'killall', 'mDNSResponderHelper'],
+                
+                # 4. 完全重启 mDNSResponder（更彻底）
+                ['sudo', '-S', 'killall', 'mDNSResponder'],
             ]
             
+            # 执行基础刷新命令
             for cmd in commands:
                 try:
                     process = subprocess.Popen(
@@ -489,14 +1046,58 @@ class DomainKiller:
                         stderr=subprocess.PIPE,
                         text=True
                     )
-                    process.communicate(input=self.sudo_password + '\n', timeout=5)
-                except:
+                    stdout, stderr = process.communicate(input=self.sudo_password + '\n', timeout=5)
+                    # killall 命令如果找不到进程会返回非零，这是正常的
+                    if process.returncode != 0 and 'killall' not in cmd[1]:
+                        print(f"⚠️ DNS 刷新命令执行警告: {cmd[1]} - {stderr}")
+                except Exception as e:
+                    # 某些命令可能在某些系统上不存在，忽略错误
                     pass
             
-            # 额外等待，确保 DNS 刷新完成
-            time.sleep(0.5)
-        except:
-            pass
+            # 5. 使用 launchctl 重启 mDNSResponder（更可靠）
+            try:
+                process = subprocess.Popen(
+                    ['sudo', '-S', 'launchctl', 'kickstart', '-k', 'system/com.apple.mDNSResponder'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                process.communicate(input=self.sudo_password + '\n', timeout=5)
+            except:
+                pass
+            
+            # 6. 刷新网络配置缓存（某些 macOS 版本需要，特别是 Safari）
+            # 获取当前网络接口
+            try:
+                # 尝试刷新 Wi-Fi 和 Ethernet 的 DNS 设置（这会触发 DNS 刷新）
+                network_commands = [
+                    ['sudo', '-S', 'networksetup', '-setdnsservers', 'Wi-Fi', 'Empty'],
+                    ['sudo', '-S', 'networksetup', '-setdnsservers', 'Ethernet', 'Empty'],
+                ]
+                
+                for cmd in network_commands:
+                    try:
+                        process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        process.communicate(input=self.sudo_password + '\n', timeout=5)
+                    except:
+                        # 某些接口可能不存在，忽略错误
+                        pass
+            except:
+                pass
+            
+            # 额外等待，确保 DNS 刷新完成（Safari 需要更长时间）
+            time.sleep(1.0)
+            
+            print("✅ DNS 缓存已强制刷新（包括 Safari）")
+        except Exception as e:
+            print(f"⚠️ DNS 刷新过程出错: {e}")
     
     def write_hosts_file(self, content):
         """写入 hosts 文件（使用更稳定的方法）"""
@@ -692,7 +1293,7 @@ class DomainKiller:
             return False
     
     def block_domains(self, domains):
-        """屏蔽域名（双重保护：hosts文件 + pfctl实时拦截）"""
+        """屏蔽域名（三重保护：hosts文件 + pfctl实时拦截 + 代理服务器）"""
         if not domains:
             return self.restore_hosts()
         
@@ -707,6 +1308,9 @@ class DomainKiller:
             
             # 2. 使用 pfctl 防火墙实时拦截（强制断开已建立的连接）
             pfctl_result = self.setup_pfctl_rules(domains)
+            
+            # 3. 启动代理服务器（对 Safari 更有效）
+            proxy_result = self.start_proxy_server(domains)
             
             if hosts_result:
                 # 强制刷新 DNS 缓存
@@ -746,9 +1350,14 @@ class DomainKiller:
                                 methods.append("hosts文件")
                             if pfctl_result:
                                 methods.append("pfctl防火墙(实时拦截)")
+                            if proxy_result:
+                                methods.append("代理服务器(Safari专用)")
                             
                             print(f"✅ 成功屏蔽 {len(domains)} 个域名（方式: {', '.join(methods)}）")
                             print("💡 提示: pfctl 防火墙可以实时拦截已打开的网站连接")
+                            print("💡 提示: 代理服务器可以拦截 Safari 浏览器的请求")
+                            if not proxy_result:
+                                print("💡 Safari 用户: 如果仍能访问，请重启 Safari 浏览器（完全退出并重新打开）")
                             return True
                         else:
                             print(f"⚠️ 警告: 以下域名可能未成功屏蔽: {', '.join(missing_domains)}")
@@ -775,12 +1384,15 @@ class DomainKiller:
             return False
     
     def restore_hosts(self):
-        """恢复 hosts 文件并清除 pfctl 规则"""
+        """恢复 hosts 文件并清除所有规则"""
         try:
-            # 1. 清除 pfctl 规则
+            # 1. 停止代理服务器
+            self.stop_proxy_server()
+            
+            # 2. 清除 pfctl 规则
             self.remove_pfctl_rules()
             
-            # 2. 恢复 hosts 文件
+            # 3. 恢复 hosts 文件
             hosts_content = self.read_hosts_file()
             new_content = self.remove_old_rules(hosts_content)
             result = self.write_hosts_file(new_content)
@@ -913,6 +1525,10 @@ class DomainKiller:
             self.status_label = ttk.Label(status_frame, text="状态: 正在启动...")
             self.status_label.pack(side=tk.LEFT)
             
+            # 代理服务器状态标签
+            self.proxy_status_label = ttk.Label(status_frame, text="代理: 检查中...", foreground="gray")
+            self.proxy_status_label.pack(side=tk.LEFT, padx=(20, 0))
+            
             self.count_label = ttk.Label(status_frame, text="", foreground="blue")
             self.count_label.pack(side=tk.RIGHT)
             
@@ -977,6 +1593,17 @@ class DomainKiller:
             
             # 立即显示初始列表（从内存或文件）
             self.update_window_domains()
+            
+            # 立即检查代理服务器状态
+            self.update_proxy_status_in_window()
+            
+            # 定期检查代理服务器状态（每3秒检查一次）
+            def periodic_check_proxy():
+                if self.window and self.running:
+                    self.update_proxy_status_in_window()
+                    self.window.after(3000, periodic_check_proxy)
+            
+            self.window.after(1000, periodic_check_proxy)  # 1秒后开始第一次检查
         except Exception as e:
             print(f"创建窗口失败: {e}")
             import traceback
